@@ -7,24 +7,22 @@ var cron = require("node-cron");
 
 //=============================== Mongo Connection ===============================//
 const conn = new MongoClient(uri.connString);
-const database = conn.db("iotDb");
-const collection = database.collection("iotCollection");
+let collection;
 
-var device = [];
-var deviceIdsFile;
+async function connectDB() {
+  await conn.connect();
+  console.log(`MongoDB connected`);
+  const database = conn.db("energygrid2");
+  collection = database.collection("energygrid2");
+}
 
-//getDeviceIds from database and save in json file
+//=============================== Mongo Connection ===============================//
 async function getDeviceIds() {
   try {
-    // const file = '/Users/BITS/deviceIds.json';
-    // let fileData = '';
     let requireFile = false;
 
     let deviceIds = await collection.distinct("Device_ID", {
       $nor: [
-        // {
-        //   Device_ID: /^A.*/,
-        // },
         {
           Device_ID: /^0.*/,
         },
@@ -36,7 +34,6 @@ async function getDeviceIds() {
     deviceIds = JSON.stringify(deviceIds);
 
     if (fse.existsSync(uri.filePath + "/deviceIds.json")) {
-      // fileData = await fs.readFile(deviceIdsFile, { encoding: 'utf8' });
       jsonDiff.diffString(
         await fs.readFile(uri.filePath + "/deviceIds.json", {
           encoding: "utf8",
@@ -52,13 +49,12 @@ async function getDeviceIds() {
 
     if (!requireFile)
       await fs.writeFile(uri.filePath + "/deviceIds.json", deviceIds);
-  } finally {
-    // Ensures that the client will close when you finish/error
-    // await conn.close();
+  } catch (err) {
+    console.error(`getDeviceIds error : `, err);
   }
 }
 
-//get last date for each device
+//=============================== Get Latest Date Per Device ===============================//
 async function iotInputData(deviceId) {
   let deviceDetails = await collection
     .find({ Device_ID: deviceId })
@@ -80,14 +76,14 @@ async function iotInputData(deviceId) {
   let dtYear = new Date(dt).getFullYear();
 
   return {
-    deviceId: deviceId,
-    dtwotime: dtwotime,
-    dtMonth: dtMonth,
-    dtYear: dtYear,
+    deviceId,
+    dtwotime,
+    dtMonth,
+    dtYear,
   };
 }
 
-//getIotDataRoomTemp from database and save in json file (to display current month RoomTemp data)
+//=============================== Data Functions ===============================//
 async function getIotDataRoomTemp() {
   let dataFile = "";
   let requireFile = false;
@@ -95,9 +91,6 @@ async function getIotDataRoomTemp() {
   let devices = JSON.parse(
     await fs.readFile(uri.filePath + "/deviceIds.json", { encoding: "utf8" })
   );
-  // devices = devices
-
-  // console.log('devices :: ', devices.reverse());
 
   await Promise.all(
     devices.map(async (d) => {
@@ -200,7 +193,6 @@ async function getIotDataRoomTemp() {
       dataFile = uri.filePath + "/roomtemp_" + d + ".json";
 
       if (fse.existsSync(dataFile)) {
-        // fileData = await fs.readFile(dataFile, { encoding: 'utf8' });
         jsonDiff.diffString(
           await fs.readFile(dataFile, { encoding: "utf8" }),
           result
@@ -220,7 +212,7 @@ async function getIotDataRoomTemp() {
   );
 }
 
-//getIotDataHumidity from database and save in json file (to display current month humidity data)
+//=============================== Data Functions ===============================//
 async function getIotDataHumidity() {
   let dataFile = "";
   let requireFile = false;
@@ -333,7 +325,6 @@ async function getIotDataHumidity() {
       dataFile = uri.filePath + "/humidity_" + d + ".json";
 
       if (fse.existsSync(dataFile)) {
-        // fileData = await fs.readFile(dataFile, { encoding: 'utf8' });
         jsonDiff.diffString(
           await fs.readFile(dataFile, { encoding: "utf8" }),
           result
@@ -353,7 +344,7 @@ async function getIotDataHumidity() {
   );
 }
 
-//getIotDataUnitConsumption from database and save in json file (to display current month humidity data)
+//=============================== Data Functions ===============================//
 async function getIotDataUnitConsumption() {
   let dataFile = "";
   let requireFile = false;
@@ -509,11 +500,19 @@ async function runAllTask() {
   }
 }
 
-runAllTask();
+//=============================== Startup ===============================//
+async () => {
+  await connectDB(); // connect once
+  console.log("test");
+  await runAllTask(); // run immediatly
 
-// Schedule all functions every 2 minutes
-cron.schedule("*/2 * * * *", () => {
-  console.log(`Running IoT data fetch at ${new Date()}`);
-
-  runAllTask();
-});
+  // Schedule all functions every 2 minutes
+  cron.schedule(
+    "*/2 * * * *",
+    () => {
+      runAllTask();
+    },
+    { timezone: "Asia/Kolkata" }
+  );
+  console.log(`cron scheduled every 2 minutes`);
+};
