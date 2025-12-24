@@ -509,11 +509,12 @@ async function runAllTask() {
   }
 }
 
-runAllTask();
-
 // Schedule all functions every 2 minutes
 cron.schedule("*/2 * * * *", () => {
   console.log(`Running IoT data fetch at ${new Date()}`);
 
-  runAllTask();
+  getDeviceIds().catch(console.dir);
+  getIotDataRoomTemp().catch(console.error);
+  getIotDataHumidity().catch(console.error);
+  getIotDataUnitConsumption().catch(console.error);
 });
