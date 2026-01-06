@@ -1,24 +1,23 @@
+// MUST BE AT TOP
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const fs = require("node:fs/promises");
 const fse = require("fs");
 const { MongoClient } = require("mongodb");
 const jsonDiff = require("json-diff");
 const uri = require("./dbconfig");
-var cron = require("node-cron");
 
 //=============================== Mongo Connection ===============================//
 const conn = new MongoClient(uri.connString);
-const database = conn.db("iotDb");
-const collection = database.collection("iotCollection");
-
-var device = [];
-var deviceIdsFile;
+const database = conn.db("energygrid2");
+const collection = database.collection("energygrid2");
 
 //getDeviceIds from database and save in json file
 async function getDeviceIds() {
   try {
-    // const file = '/Users/BITS/deviceIds.json';
-    // let fileData = '';
-    let requireFile = false;
+    let delFile = false;
 
     let deviceIds = await collection.distinct("Device_ID", {
       $nor: [
@@ -43,14 +42,14 @@ async function getDeviceIds() {
         }),
         deviceIds
       ).length > 0
-        ? (requireFile = false)
-        : (requireFile = true);
-      if (!requireFile) fs.unlink(uri.filePath + "/deviceIds.json");
+        ? (delFile = false)
+        : (delFile = true);
+      if (!delFile) await fs.unlink(uri.filePath + "/deviceIds.json");
     } else {
-      requireFile = false;
+      delFile = false;
     }
 
-    if (!requireFile)
+    if (!delFile)
       await fs.writeFile(uri.filePath + "/deviceIds.json", deviceIds);
   } finally {
     // Ensures that the client will close when you finish/error
@@ -66,455 +65,299 @@ async function iotInputData(deviceId) {
     .limit(1)
     .toArray();
 
-  var dt = new Date(deviceDetails[0].Time_Stamp).toLocaleString("en-US", {
-    timeZone: "Asia/Kolkata",
-  });
+  if (
+    !deviceDetails ||
+    deviceDetails.length === 0 ||
+    !deviceDetails[0].Time_Stamp
+  ) {
+    console.log(`No data found for device ${deviceId}, skipping...`);
+    return null; // return null or undefined to indicate no data
+  }
 
-  let dtwotime = `${new Date(dt).getFullYear()}-${(
-    "0" +
-    (new Date(dt).getMonth() + 1)
-  ).slice(-2)}-${new Date(dt).getDate()}`;
+  // Convert to Date (assumes Time_Stamp is ISO or valid date string)
+  const utcDate = new Date(deviceDetails[0].Time_Stamp);
 
-  let dtMonth = new Date(dt).getMonth() + 1;
+  // Convert UTC -> IST (+5.30)
+  const istDate = new Date(utcDate.getTime() + 330 * 60 * 1000);
 
-  let dtYear = new Date(dt).getFullYear();
+  const year = istDate.getFullYear();
+  const month = istDate.getMonth() + 1;
+  const day = String(istDate.getDate()).padStart(2, "0");
 
   return {
-    deviceId: deviceId,
-    dtwotime: dtwotime,
-    dtMonth: dtMonth,
-    dtYear: dtYear,
+    deviceId,
+    dtwotime: `${year}-${String(month).padStart(2, "0")}-${day}`,
+    dtMonth: month,
+    dtYear: year,
   };
 }
 
-//getIotDataRoomTemp from database and save in json file (to display current month RoomTemp data)
-async function getIotDataRoomTemp() {
-  let dataFile = "";
-  let requireFile = false;
+async function basePipeLine(contents, type) {
+  const groupStage = {
+    _id: "$creationDate",
+  };
 
-  let devices = JSON.parse(
-    await fs.readFile(uri.filePath + "/deviceIds.json", { encoding: "utf8" })
+  if (type === "roomtemp") {
+    groupStage.avgTemperature = { $avg: "$Temperature" };
+  }
+
+  if (type === "humidity") {
+    groupStage.avgHumidity = { $avg: "$Humidity" };
+  }
+
+  if (type === "unitConsumption") {
+    groupStage.avgUnitConsumption = { $avg: "$unit_consumption" };
+  }
+
+  const projectStage = {
+    _id: 1,
+  };
+
+  if (type === "roomtemp") {
+    projectStage.temperature = { $round: ["$avgTemperature", 2] };
+  }
+
+  if (type === "humidity") {
+    projectStage.humidity = { $round: ["$avgHumidity", 2] };
+  }
+
+  if (type === "unitConsumption") {
+    projectStage.unitConsumption = { $round: ["$avgUnitConsumption", 3] };
+  }
+
+  const pipeline = [
+    {
+      $addFields: {
+        changedt: {
+          $dateFromString: {
+            dateString: "$Time_Stamp",
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        addhours: {
+          $dateAdd: {
+            startDate: "$changedt",
+            unit: "hour",
+            amount: 5,
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        newTime_Stamp: {
+          $dateAdd: {
+            startDate: "$addhours",
+            unit: "minute",
+            amount: 30,
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        creationDate: {
+          $dateToString: { format: "%Y-%m-%d", date: "$newTime_Stamp" },
+        },
+      },
+    },
+    {
+      $addFields: {
+        maxDate: {
+          $max: "$creationDate",
+        },
+      },
+    },
+    {
+      $addFields: {
+        monthDate: {
+          $month: "$newTime_Stamp",
+        },
+      },
+    },
+    {
+      $addFields: {
+        yearDate: {
+          $year: "$newTime_Stamp",
+        },
+      },
+    },
+    {
+      $match: {
+        Device_ID: contents.deviceId,
+        monthDate: contents.dtMonth,
+        yearDate: contents.dtYear,
+      },
+    },
+    { $group: groupStage },
+    { $project: projectStage },
+    { $sort: { _id: 1 } },
+  ];
+
+  return JSON.stringify(
+    await collection.aggregate(pipeline, { allowDiskUse: true }).toArray()
   );
-  // devices = devices
+}
 
-  // console.log('devices :: ', devices.reverse());
+//getIotDataRoomTemp from database and save in json file (to display current month RoomTemp data)
+//===============================================================================================//
+async function getIotDataRoomTemp() {
+  const devices = JSON.parse(
+    await fs.readFile(`${uri.filePath}/deviceIds.json`, "utf8")
+  );
 
   await Promise.all(
-    devices.map(async (d) => {
-      let contents = await iotInputData(d);
-      requireFile = false;
+    devices.map(async (deviceId) => {
+      try {
+        const contents = await iotInputData(deviceId);
+        const result = await basePipeLine(contents, "roomtemp");
 
-      const pipeline = [
-        {
-          $addFields: {
-            changedt: {
-              $dateFromString: {
-                dateString: "$Time_Stamp",
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            addhours: {
-              $dateAdd: {
-                startDate: "$changedt",
-                unit: "hour",
-                amount: 5,
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            newTime_Stamp: {
-              $dateAdd: {
-                startDate: "$addhours",
-                unit: "minute",
-                amount: 30,
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            creationDate: {
-              $dateToString: { format: "%Y-%m-%d", date: "$newTime_Stamp" },
-            },
-          },
-        },
-        {
-          $addFields: {
-            maxDate: {
-              $max: "$creationDate",
-            },
-          },
-        },
-        {
-          $addFields: {
-            monthDate: {
-              $month: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $addFields: {
-            monthDate: {
-              $month: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $addFields: {
-            yearDate: {
-              $year: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $match: {
-            Device_ID: contents.deviceId,
-            // maxDate: contents.dtwotime,
-            monthDate: contents.dtMonth,
-            yearDate: contents.dtYear,
-          },
-        },
-        {
-          $group: {
-            _id: "$maxDate",
-            avgroomtemp: { $avg: "$room_temp" },
-          },
-        },
-        {
-          $project: {
-            roomTemp: { $round: ["$avgroomtemp", 2] },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ];
+        const dataFile = `${uri.filePath}/roomtemp_${deviceId}.json`;
 
-      let result = JSON.stringify(
-        await collection.aggregate(pipeline, { allowDiskUse: true }).toArray()
-      );
+        let shouldWrite = true;
 
-      dataFile = uri.filePath + "/roomtemp_" + d + ".json";
+        if (fse.existsSync(dataFile)) {
+          const existingData = await fs.readFile(dataFile, "utf8");
 
-      if (fse.existsSync(dataFile)) {
-        // fileData = await fs.readFile(dataFile, { encoding: 'utf8' });
-        jsonDiff.diffString(
-          await fs.readFile(dataFile, { encoding: "utf8" }),
-          result
-        ).length > 0
-          ? (requireFile = false)
-          : (requireFile = true);
-        if (!requireFile) fs.unlink(dataFile);
-      } else {
-        requireFile = false;
-      }
+          // compare content
+          if (existingData === result) {
+            shouldWrite = false;
+          }
+        }
 
-      if (!requireFile) {
-        await fs.writeFile(dataFile, result);
-        console.log("Room Temp : ", "roomtemp_" + d);
+        if (shouldWrite) {
+          await fs.writeFile(dataFile, result);
+          console.log("Room Temp updated:", `roomtemp_${deviceId}.json`);
+        } else {
+          console.log("Room Temp unchanged:", `roomtemp_${deviceId}.json`);
+        }
+      } catch (err) {
+        console.error(`Room Temp error for ${deviceId}:`, err.message);
       }
     })
   );
 }
 
+//===============================================================================================//
 //getIotDataHumidity from database and save in json file (to display current month humidity data)
 async function getIotDataHumidity() {
-  let dataFile = "";
-  let requireFile = false;
-
-  let devices = JSON.parse(
-    await fs.readFile(uri.filePath + "/deviceIds.json", { encoding: "utf8" })
+  const devices = JSON.parse(
+    await fs.readFile(`${uri.filePath}/deviceIds.json`, "utf8")
   );
 
   await Promise.all(
-    devices.map(async (d) => {
-      let contents = await iotInputData(d);
-      requireFile = false;
+    devices.map(async (deviceId) => {
+      try {
+        const contents = await iotInputData(deviceId);
+        const result = await basePipeLine(contents, "humidity");
 
-      const pipeline = [
-        {
-          $addFields: {
-            changedt: {
-              $dateFromString: {
-                dateString: "$Time_Stamp",
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            addhours: {
-              $dateAdd: {
-                startDate: "$changedt",
-                unit: "hour",
-                amount: 5,
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            newTime_Stamp: {
-              $dateAdd: {
-                startDate: "$addhours",
-                unit: "minute",
-                amount: 30,
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            creationDate: {
-              $dateToString: { format: "%Y-%m-%d", date: "$newTime_Stamp" },
-            },
-          },
-        },
-        {
-          $addFields: {
-            maxDate: {
-              $max: "$creationDate",
-            },
-          },
-        },
-        {
-          $addFields: {
-            monthDate: {
-              $month: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $addFields: {
-            monthDate: {
-              $month: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $addFields: {
-            yearDate: {
-              $year: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $match: {
-            Device_ID: contents.deviceId,
-            // maxDate: contents.dtwotime,
-            monthDate: contents.dtMonth,
-            yearDate: contents.dtYear,
-          },
-        },
-        {
-          $group: {
-            _id: "$maxDate",
+        const dataFile = `${uri.filePath}/humidity_${deviceId}.json`;
 
-            avghumidity: { $avg: "$Humidity" },
-          },
-        },
-        {
-          $project: {
-            humidity: { $round: ["$avghumidity", 2] },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ];
+        let shouldWrite = true;
 
-      let result = JSON.stringify(
-        await collection.aggregate(pipeline, { allowDiskUse: true }).toArray()
-      );
+        if (fse.existsSync(dataFile)) {
+          const existingData = await fs.readFile(dataFile, "utf8");
 
-      console.log(JSON.stringify(result, null, 2));
+          // compare content
+          if (existingData === result) {
+            shouldWrite = false;
+          }
+        }
 
-      dataFile = uri.filePath + "/humidity_" + d + ".json";
-
-      if (fse.existsSync(dataFile)) {
-        // fileData = await fs.readFile(dataFile, { encoding: 'utf8' });
-        jsonDiff.diffString(
-          await fs.readFile(dataFile, { encoding: "utf8" }),
-          result
-        ).length > 0
-          ? (requireFile = false)
-          : (requireFile = true);
-        if (!requireFile) fs.unlink(dataFile);
-      } else {
-        requireFile = false;
-      }
-
-      if (!requireFile) {
-        await fs.writeFile(dataFile, result);
-        console.log("Humidity : ", "Humidity_" + d);
+        if (shouldWrite) {
+          await fs.writeFile(dataFile, result);
+          console.log("Humidity updated:", `humidity_${deviceId}.json`);
+        } else {
+          console.log("Humidity unchanged:", `humidity_${deviceId}.json`);
+        }
+      } catch (err) {
+        console.error(`Humidity error for ${deviceId}:`, err.message);
       }
     })
   );
 }
 
+//====================================================================================================//
 //getIotDataUnitConsumption from database and save in json file (to display current month humidity data)
 async function getIotDataUnitConsumption() {
-  let dataFile = "";
-  let requireFile = false;
-
-  let devices = JSON.parse(
-    await fs.readFile(uri.filePath + "/deviceIds.json", { encoding: "utf8" })
+  const devices = JSON.parse(
+    await fs.readFile(`${uri.filePath}/deviceIds.json`, "utf8")
   );
 
   await Promise.all(
-    devices.map(async (d) => {
-      let contents = await iotInputData(d);
-      requireFile = false;
+    devices.map(async (deviceId) => {
+      try {
+        const contents = await iotInputData(deviceId);
+        const result = await basePipeLine(contents, "unitConsumption");
 
-      const pipeline = [
-        {
-          $addFields: {
-            changedt: {
-              $dateFromString: {
-                dateString: "$Time_Stamp",
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            addhours: {
-              $dateAdd: {
-                startDate: "$changedt",
-                unit: "hour",
-                amount: 5,
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            newTime_Stamp: {
-              $dateAdd: {
-                startDate: "$addhours",
-                unit: "minute",
-                amount: 30,
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            creationDate: {
-              $dateToString: { format: "%Y-%m-%d", date: "$newTime_Stamp" },
-            },
-          },
-        },
-        {
-          $addFields: {
-            maxDate: {
-              $max: "$creationDate",
-            },
-          },
-        },
-        {
-          $addFields: {
-            monthDate: {
-              $month: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $addFields: {
-            monthDate: {
-              $month: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $addFields: {
-            yearDate: {
-              $year: "$newTime_Stamp",
-            },
-          },
-        },
-        {
-          $match: {
-            Device_ID: contents.deviceId,
-            // maxDate: contents.dtwotime,
-            monthDate: contents.dtMonth,
-            yearDate: contents.dtYear,
-          },
-        },
-        {
-          $group: {
-            _id: "$maxDate",
+        const dataFile = `${uri.filePath}/unitConsumption_${deviceId}.json`;
 
-            avgUnitConsumption: { $avg: "$unit_consumption" },
-          },
-        },
-        {
-          $project: {
-            unitConsumption: { $round: ["$avgUnitConsumption", 2] },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ];
+        let shouldWrite = true;
 
-      let result = JSON.stringify(
-        await collection.aggregate(pipeline, { allowDiskUse: true }).toArray()
-      );
+        if (fse.existsSync(dataFile)) {
+          const existingData = await fs.readFile(dataFile, "utf8");
 
-      dataFile = uri.filePath + "/unitConsumption_" + d + ".json";
+          // compare content
+          if (existingData === result) {
+            shouldWrite = false;
+          }
+        }
 
-      if (fse.existsSync(dataFile)) {
-        // fileData = await fs.readFile(dataFile, { encoding: 'utf8' });
-        jsonDiff.diffString(
-          await fs.readFile(dataFile, { encoding: "utf8" }),
-          result
-        ).length > 0
-          ? (requireFile = false)
-          : (requireFile = true);
-        if (!requireFile) fs.unlink(dataFile);
-      } else {
-        requireFile = false;
-      }
-
-      if (!requireFile) {
-        await fs.writeFile(dataFile, result);
-        console.log("unitConsumption_ : ", "unitConsumption_" + d);
+        if (shouldWrite) {
+          await fs.writeFile(dataFile, result);
+          console.log(
+            "Unit comsumption updated:",
+            `unitConsumption_${deviceId}.json`
+          );
+        } else {
+          console.log(
+            "Unit comsumption unchanged:",
+            `unitConsumption_${deviceId}.json`
+          );
+        }
+      } catch (err) {
+        console.error(`Unit comsumption error for ${deviceId}:`, err.message);
       }
     })
   );
 }
 
 //=============================== Master Runner ===============================//
-let isRunning = false;
+// (async () => {
+//   await conn.connect();
+//   console.log("MongoDB connected");
 
-async function runAllTask() {
-  if (isRunning) {
-    console.log(`Previous job still running, skipping`);
-    return;
+//   await getDeviceIds();
+//   await getIotDataRoomTemp();
+//   await getIotDataHumidity();
+//   await getIotDataUnitConsumption();
+// })();
+
+(async () => {
+  await conn.connect();
+  console.log("MongoDB connected");
+
+  while (true) {
+    try {
+      console.log("=== JOB START ===", new Date().toLocaleString());
+
+      await getDeviceIds();
+      await getIotDataRoomTemp();
+      await getIotDataHumidity();
+      await getIotDataUnitConsumption();
+
+      console.log("=== JOB END ===", new Date().toLocaleString());
+      console.log("Sleeping for 2 minutes...\n");
+
+      await sleep(2 * 60 * 1000); // 2 minutes
+    } catch (err) {
+      console.error("Main loop error:", err);
+
+      // Safety sleep even if something fails
+      await sleep(2 * 60 * 1000);
+    }
   }
-
-  isRunning = true;
-  console.log(`Running IoT data fetch at ${new Date()}`);
-
-  try {
-    await getDeviceIds();
-    await getIotDataRoomTemp();
-    await getIotDataHumidity();
-    await getIotDataUnitConsumption();
-  } catch (error) {
-    console.error(`Job error : `, error);
-  } finally {
-    isRunning = false;
-    console.log(`Job finished at ${new Date()}`);
-  }
-}
-
-// Schedule all functions every 2 minutes
-cron.schedule("*/2 * * * *", () => {
-  console.log(`Running IoT data fetch at ${new Date()}`);
-
-  getDeviceIds().catch(console.dir);
-  getIotDataRoomTemp().catch(console.error);
-  getIotDataHumidity().catch(console.error);
-  getIotDataUnitConsumption().catch(console.error);
-});
+})();
